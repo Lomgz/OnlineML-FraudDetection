@@ -10,8 +10,8 @@ parser.add_argument("--rows", type=int, default=5000,
                     help="Max transactions to send, default 5000")
 parser.add_argument("--server", type=str, default="http://localhost:8000",
                     help="URL of ML Engine server")
-parser.add_argument("--data", type=str, default="data/creditcard.csv",
-                    help="Path to CSV file")
+parser.add_argument("--data", type=str, default="data/creditcard_suffix.csv",
+                    help="Path to CSV file (Default: 50%% Suffix evaluation stream)")
 args = parser.parse_args()
 
 SERVER = args.server.rstrip("/")

@@ -26,3 +26,8 @@ Note.txt
 # Datasets
 *.csv
 data/
+
+# Documentation
+docs/
+*.html
+*.txt

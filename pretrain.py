@@ -3,7 +3,7 @@ import pickle
 import time
 from river import linear_model, preprocessing, compose, optim
 
-DATA_FILE = "data/creditcard.csv"
+DATA_FILE = "data/creditcard_prefix.csv"
 MODEL_SGD_OUTPUT = "model_sgd.pkl"
 MODEL_ADAM_OUTPUT = "model_adam.pkl"
 
