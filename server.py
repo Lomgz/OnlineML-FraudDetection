@@ -19,7 +19,7 @@ MODEL_SGD_FILE = "model_sgd.pkl"
 MODEL_ADAM_FILE = "model_adam.pkl"
 MODEL_RF_FILE = "model_rf.pkl"
 
-if os.path.exists(MODEL_SGD_FILE) and os.path.exists(MODEL_ADAM_FILE) and os.path.exists(MODEL_RF_FILE): 
+if os.path.exists(MODEL_SGD_FILE) and os.path.exists(MODEL_ADAM_FILE) and os.path.exists(MODEL_RF_FILE):
     print("[Server] Successfully loaded pretrained models from .pkl files!")
     with open(MODEL_SGD_FILE, "rb") as f:
         model_sgd = pickle.load(f)
@@ -123,14 +123,17 @@ def recompute_window_metrics():
     
     pr_k_sgd, k_eval = compute_pr_at_k(active_window, "prob_sgd", alpha=alpha_val)
     pr_k_adam, _ = compute_pr_at_k(active_window, "prob_adam", alpha=alpha_val)
+    pr_k_rf, _ = compute_pr_at_k(active_window, "prob_rf", alpha=alpha_val)
     
     y_win = [item["label"] for item in active_window]
     frauds_in_win = sum(y_win)
     if frauds_in_win > 0:
         sgd_scores = [item["prob_sgd"] for item in active_window]
         adam_scores = [item["prob_adam"] for item in active_window]
+        rf_scores = [item["prob_rf"] for item in active_window]
         stats["sk_ap_sgd"] = round(float(average_precision_score(y_win, sgd_scores)), 6)
         stats["sk_ap_adam"] = round(float(average_precision_score(y_win, adam_scores)), 6)
+        stats["sk_ap_rf"] = round(float(average_precision_score(y_win, rf_scores)), 6)
     else:
         stats["sk_ap_sgd"] = 0.0
         stats["sk_ap_adam"] = 0.0
