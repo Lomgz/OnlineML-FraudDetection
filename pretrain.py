@@ -47,7 +47,8 @@ def main():
             
             for raw_row in reader:
                 features, label = parse_row(raw_row)
-                
+
+                # Learn on each row of data
                 # Cập nhật từng dòng cho mô hình Online (SGD, Adam)
                 model_sgd.learn_one(features, label)
                 model_adam.learn_one(features, label)
