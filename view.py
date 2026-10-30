@@ -179,7 +179,7 @@ def render_dashboard():
     st.success("ML Server Online - San sang tiep nhan luong giao dich bien")
 
     # Top KPI Metric Cards
-    col_kpi1, col_kpi2, col_kpi3, col_kpi4, col_kpi5 = st.columns(5)
+    col_kpi1, col_kpi2, col_kpi3, col_kpi4, col_kpi5, col_kpi6 = st.columns(6)
     col_kpi1.metric("Tong Giao Dich", f"{stats.get('total', 0):,}")
     col_kpi2.metric("Gian Lan Phat Hien", stats.get("fraud_detected", 0), delta=None, delta_color="inverse")
     col_kpi3.metric("So Lenh Bi Chan", stats.get("blocked", 0))
@@ -188,6 +188,8 @@ def render_dashboard():
     sk_ap_sgd_val = stats.get('sk_ap_sgd', 0.0)
     prauc_adam_val = stats.get('prauc_adam', 0.0)
     sk_ap_adam_val = stats.get('sk_ap_adam', 0.0)
+    prauc_rf_val = stats.get('prauc_rf', 0.0) 
+    sk_ap_rf_val = stats.get('sk_ap_rf', 0.0)
 
     col_kpi4.metric(
         "PR-AUC (SGD)",
@@ -199,7 +201,11 @@ def render_dashboard():
         f"{prauc_adam_val:.4f}",
         help=f"River RollingPRAUC: {prauc_adam_val:.4f} | Sklearn AP: {sk_ap_adam_val:.4f}"
     )
-
+    col_kpi6.metric(
+        "PR-AUC (RF)",
+        f"{prauc_rf_val:.4f}",
+        help=f"River RollingPRAUC: {prauc_rf_val:.4f} | Sklearn AP: {sk_ap_rf_val:.4f}"
+    )
     st.divider()
 
     # Tab Navigation
@@ -225,7 +231,7 @@ def render_dashboard():
                 fig_line = px.line(
                     df,
                     x="index",
-                    y=["prob_sgd", "prob_adam"],
+                    y=["prob_sgd", "prob_adam", "prob_rf"], 
                     labels={"index": "Thu tu Giao dich", "value": "P(fraud)", "variable": "Mo hinh"},
                     template="plotly_dark",
                     height=320,
@@ -263,7 +269,7 @@ def render_dashboard():
 
             st.divider()
             st.subheader("Hieu Nang Mo Hinh Theo Chuan Protocol v2")
-            col_perf1, col_perf2 = st.columns(2)
+            col_perf1, col_perf2, col_perf3 = st.columns(3)
 
             k_val = stats.get("k_eval", 1)
             win_size = stats.get("window_size", window_size)
@@ -297,7 +303,7 @@ False Negatives: {stats.get('cm_adam', {}).get('fn', 0):<6} | True Negatives : {
 
             st.divider()
             st.subheader("Nhat Ky Giao Dich Gan Nhat (Audit Log)")
-            display_df = df[["transaction_id", "prob_sgd", "prob_adam", "action", "timestamp"]].copy()
+            display_df = df[["transaction_id", "prob_sgd", "prob_adam", "prob_rf", "action", "timestamp"]].copy()
             display_df["timestamp"] = pd.to_datetime(display_df["timestamp"], unit="s").dt.strftime("%H:%M:%S")
             display_df = display_df.iloc[::-1].reset_index(drop=True)
             st.dataframe(
@@ -311,6 +317,9 @@ False Negatives: {stats.get('cm_adam', {}).get('fn', 0):<6} | True Negatives : {
                     "prob_adam": st.column_config.ProgressColumn(
                         "P(fraud) Adam", min_value=0, max_value=1, format="%.4f"
                     ),
+                    "prob_rf": st.column_config.ProgressColumn(
+                        "P(fraud) RF", min_value=0, max_value=1, format="%.4f"
+),
                     "action": st.column_config.TextColumn("Quyet Dinh"),
                 }
             )
@@ -331,6 +340,8 @@ False Negatives: {stats.get('cm_adam', {}).get('fn', 0):<6} | True Negatives : {
             sgd_r = pr_data["sgd"]["recall"]
             adam_p = pr_data["adam"]["precision"]
             adam_r = pr_data["adam"]["recall"]
+            rf_p = pr_data["rf"]["precision"]
+            rf_r = pr_data["rf"]["recall"]
 
             fig_pr = go.Figure()
             fig_pr.add_trace(go.Scatter(
@@ -342,6 +353,11 @@ False Negatives: {stats.get('cm_adam', {}).get('fn', 0):<6} | True Negatives : {
                 x=adam_r, y=adam_p, mode="lines+markers",
                 name=f"Adam (Sklearn AP = {sk_ap_adam_val:.4f})",
                 line=dict(color="#10b981", width=2.5, dash="dash")
+            ))
+            fig_pr.add_trace(go.Scatter( 
+                x=rf_r, y=rf_p, mode="lines+markers",
+                name=f"RF (Sklearn AP = {sk_ap_rf_val:.4f})",
+                line=dict(color="#ef4444", width=2.5, dash="dot")
             ))
             fig_pr.update_layout(
                 title=f"Precision-Recall Curve (Cua so: {pr_data.get('window_size', 0)} giao dich, {pr_data.get('frauds_in_window', 0)} ca gian lan)",
