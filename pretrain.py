@@ -1,111 +1,88 @@
 import csv
 import pickle
 import time
-from river import linear_model, preprocessing, compose, optim
+from river import forest, tree
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction import DictVectorizer
 from sklearn.pipeline import make_pipeline
 
 DATA_FILE = "data/creditcard_prefix.csv"
+MODEL_HAT_OUTPUT = "model_hat.pkl"
+MODEL_ARF_OUTPUT = "model_arf.pkl"
+MODEL_RF_OUTPUT  = "model_rf.pkl"
+# Tuong thich nguoc:
 MODEL_SGD_OUTPUT = "model_sgd.pkl"
 MODEL_ADAM_OUTPUT = "model_adam.pkl"
 
+
 def parse_row(row: dict) -> tuple[dict, int]:
     label = int(float(row.pop("Class", 0)))
-    row.pop("Time", None) # Remove Time column
+    row.pop("Time", None)
     features = {k: float(v) for k, v in row.items() if v != ""}
     return features, label
 
-def main():
-    print(f"[PRETRAIN] Starting Pre-training process from file: {DATA_FILE}")
-    
-    # 1. Initialize empty models
-    opt_sgd = optim.SGD(lr=0.1)
-    model_sgd = compose.Pipeline(
-        preprocessing.StandardScaler(),
-        linear_model.LogisticRegression(optimizer=opt_sgd)
-    )
 
-    opt_adam = optim.Adam(lr=0.01)
-    model_adam = compose.Pipeline(
-        preprocessing.StandardScaler(),
-        linear_model.LogisticRegression(optimizer=opt_adam)
-    )
+def main():
+    print(f"[Pretrain] Bat dau huan luyen tu tep: {DATA_FILE}")
+
+    # 1. Khoi tao mo hinh streaming chuyen biet (HAT & ARF)
+    model_hat = tree.HoeffdingAdaptiveTreeClassifier(grace_period=50, seed=42)
+    model_arf = forest.ARFClassifier(n_models=15, grace_period=50, seed=42)
 
     count = 0
     fraud_count = 0
     start_time = time.time()
+    X_train_batch, y_train_batch = [], []
 
-    # 2. Train with historical data
-    X_train_batch = []
-    y_train_batch = []
-
-    # 2. Train with historical data
     try:
-        with open(DATA_FILE, newline="", encoding="utf-8") as csvfile:
-            reader = csv.DictReader(csvfile)
-            
+        with open(DATA_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
             for raw_row in reader:
                 features, label = parse_row(raw_row)
 
-                # Learn on each row of datagit add .
-                # Cập nhật từng dòng cho mô hình Online (SGD, Adam)
-                model_sgd.learn_one(features, label)
-                model_adam.learn_one(features, label)
-                
-                # Gom dữ liệu lại cho mô hình Batch (Random Forest)
+                # Trong so phat cao cho lop gian lan (class imbalance)
+                weight = 250.0 if label == 1 else 1.0
+                model_hat.learn_one(features, label, w=weight)
+                model_arf.learn_one(features, label, w=weight)
+
                 X_train_batch.append(features)
                 y_train_batch.append(label)
-                
+
                 if label == 1:
                     fraud_count += 1
-                
                 count += 1
-                if count % 10000 == 0:
-                    print(f"[PRETRAIN] Trained {count} transactions...")
-                    
+
+                if count % 20000 == 0:
+                    print(f"  -> Da huan luyen {count:,} giao dich...")
+
     except FileNotFoundError:
-        print(f"[PRETRAIN] Error: File {DATA_FILE} not found")
+        print(f"[Pretrain Error] Khong tim thay tep: {DATA_FILE}")
         return
 
-    print("[PRETRAIN] Training Batch Random Forest model...")
+    # 2. Huan luyen Batch Random Forest lam baseline tinh
+    print("[Pretrain] Huan luyen Batch Random Forest (Scikit-Learn baseline)...")
     model_rf = make_pipeline(
         DictVectorizer(sparse=False),
-        RandomForestClassifier(n_estimators=50, max_depth=10, class_weight='balanced', random_state=42, n_jobs=-1)
+        RandomForestClassifier(n_estimators=50, max_depth=10, class_weight="balanced", random_state=42, n_jobs=-1)
     )
     model_rf.fit(X_train_batch, y_train_batch)
 
-    # 3. Save the model to .pkl file
-    with open(MODEL_SGD_OUTPUT, "wb") as f:
-        pickle.dump(model_sgd, f)
-    with open(MODEL_ADAM_OUTPUT, "wb") as f:
-        pickle.dump(model_adam, f)
-    with open("model_rf.pkl", "wb") as f:
-        pickle.dump(model_rf, f)
-        
-    elapsed = time.time() - start_time
-    print("-" * 50)
-    print(f"[PRETRAIN] Completed training {count} transactions ({fraud_count} frauds).")
-    print(f"[PRETRAIN] Saved SGD model to: {MODEL_SGD_OUTPUT}")
-    print(f"[PRETRAIN] Saved Adam model to: {MODEL_ADAM_OUTPUT}")
-    print(f"[PRETRAIN] Saved RF model to: model_rf.pkl")
+    # 3. Luu tru cac mo hinh
+    for path, model in [
+        (MODEL_HAT_OUTPUT, model_hat),
+        (MODEL_ARF_OUTPUT, model_arf),
+        (MODEL_RF_OUTPUT, model_rf),
+        (MODEL_SGD_OUTPUT, model_hat),
+        (MODEL_ADAM_OUTPUT, model_arf),
+    ]:
+        with open(path, "wb") as f:
+            pickle.dump(model, f)
 
-    # 3. Save the model to .pkl file
-    with open(MODEL_SGD_OUTPUT, "wb") as f:
-        pickle.dump(model_sgd, f)
-    with open(MODEL_ADAM_OUTPUT, "wb") as f:
-        pickle.dump(model_adam, f)
-    with open("model_rf.pkl", "wb") as f:
-        pickle.dump(model_rf, f)
-        
     elapsed = time.time() - start_time
     print("-" * 50)
-    print(f"[PRETRAIN] Completed training {count} transactions ({fraud_count} frauds).")
-    print(f"[PRETRAIN] Time taken: {elapsed:.2f} seconds.")
-    print(f"[PRETRAIN] Saved SGD model to: {MODEL_SGD_OUTPUT}")
-    print(f"[PRETRAIN] Saved Adam model to: {MODEL_ADAM_OUTPUT}")
-    print(f"[PRETRAIN] Saved RF model to: model_rf.pkl")
-    print("[PRETRAIN] The Server can now load these files for immediate use!")
+    print(f"[Pretrain] Hoan tat: {count:,} giao dich ({fraud_count} gian lan) trong {elapsed:.1f}s.")
+    print(f"[Pretrain] Da luu: {MODEL_HAT_OUTPUT}, {MODEL_ARF_OUTPUT}, {MODEL_RF_OUTPUT}.")
+
 
 if __name__ == "__main__":
     main()

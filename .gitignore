@@ -7,9 +7,15 @@ __pycache__/
 venv/
 env/
 .env
+.venv/
 
 # Model files
 *.pkl
+
+# Runtime files
+*.pid
+*.log
+boost_status.json
 
 # IDEs
 .vscode/
@@ -31,3 +37,5 @@ data/
 docs/
 *.html
 *.txt
+
+*.log
