@@ -6,11 +6,12 @@ A high-throughput, sub-millisecond **Online Machine Learning (Streaming ML)** sy
 
 ## 1. System Positioning & Core Thesis
 
-Traditional batch-learning models (e.g., XGBoost or Random Forest retrained on daily/weekly schedules) suffer from critical limitations in high-velocity financial payment environments:
-1. **Blind Window & Concept Drift Lag:** New fraud patterns bypass static models during the multi-hour or multi-day lag between batch retraining cycles.
-2. **Inference Latency & Heavy Footprint:** Traditional ensemble models demand high compute/memory, making them unsuitable for in-flight transaction authorization at network edges.
+Traditional batch-learning models (e.g., XGBoost or Random Forest retrained on daily/weekly schedules) face fundamental challenges in high-velocity financial payment environments:
+1. **Blind Window & Concept Drift Lag:** Emerging fraud patterns easily bypass static models during the multi-hour or multi-day lag between batch retraining cycles.
+2. **Flooding by Legitimate Transactions & Catastrophic Forgetting:** In production payment networks where fraud accounts for under 0.2% of traffic, streaming models continuously updated only on clean transactions suffer from severe knowledge decay regarding historical fraud signatures.
+3. **Inference Latency & Edge Footprints:** Bulky ensemble trees require significant compute and memory, making in-line sub-millisecond authorization impractical at distributed network edges.
 
-This engine repositions fraud detection into **two complementary production deployment topologies**:
+This engine repositions real-time fraud detection into **two complementary production deployment topologies**:
 
 ```
 +--------------------------------------------------------------------------------------------------+
@@ -28,96 +29,182 @@ This engine repositions fraud detection into **two complementary production depl
   TOPOLOGY B: Cloud / Data Center Streaming (Message Broker Decoupled Architecture)
   +------------------------------------------------------------------------------------------------+
   | Message Broker (Apache Kafka / Redis Streams / Apache Flink)                                   |
-  |  - Topic `payment-transactions`: High-throughput ingestion & distributed inference             |
-  |  - Topic `fraud-chargebacks`: Delayed ground-truth feedback streaming for live weight updates   |
+  |  - Topic payment-transactions: High-throughput ingestion & distributed inference               |
+  |  - Topic fraud-chargebacks: Delayed ground-truth feedback streaming for live weight updates    |
   +------------------------------------------------------------------------------------------------+
                                  |                                   |
                                  v                                   v
                     +---------------------------+       +---------------------------+
                     | Live Streamlit Monitoring |       | Cold Lake / Audit Storage |
-                    | (PR-AUC, Pr@k, Drift)     |       | (Compliance & Forensics)  |
+                    | (PR-AUC, Pr@k, Drift, PER)|       | (Compliance & Forensics)  |
                     +---------------------------+       +---------------------------+
 ```
 
-### Why Online Logistic Regression (SGD vs. Adam) for Edge Gateways?
-- **$O(1)$ Memory & Compute Footprint:** Model state requires only storing weight vectors $W$ (and moments $m, v$ for Adam). No raw transactions need to be persisted in memory.
-- **Sub-millisecond SLA:** Scoring takes `< 1ms`, fitting comfortably inside payment gateway authorization windows (< 50ms).
-- **Instantaneous Weight Adaptation:** The moment a chargeback or merchant confirmation arrives, weights adapt via `learn_one()` without taking the service offline.
-- **Drift Responsiveness:** SGD adapts instantly to sudden shifts in fraud strategies without momentum damping, while Adam provides smooth convergence for steady-state traffic.
+---
+
+## 2. Multi-Model Architecture & Algorithmic Families
+
+The system orchestrates and benchmarks five distinct model architectures across three machine learning paradigms:
+
+| Model Architecture | Machine Learning Family | Update Mechanism | Primary Advantage | Operational Role |
+| :--- | :--- | :--- | :--- | :--- |
+| **Static Random Forest** | Offline Batch Learning (Scikit-Learn) | Static ($N=50$ trees, pre-trained on Prefix) | Stable baseline, immune to stream noise | Baseline Benchmark Control |
+| **Logistic Regression (SGD)** | Online Linear Model (River) | Stochastic Gradient Descent (`learn_one`) | Extremely lightweight, $O(1)$ memory | Edge Gateway Line-Rate |
+| **Logistic Regression (Adam)** | Online Linear Model (River) | Adaptive Moment Estimation ($m_t, v_t$) | Smooth convergence under steady distributions | Edge Gateway Line-Rate |
+| **Hoeffding Adaptive Tree (HAT)** | Incremental Adaptive Decision Tree (River) | Hoeffding Bound split + ADWIN drift detector | Sub-tree replacement upon detecting concept drift | Streaming Non-linear Classifier |
+| **Adaptive Random Forest (ARF)** | Online Ensemble Learning (River) | Online Bagging ($\lambda=6$) + ADWIN drift detector | Background tree replacement without interrupting inference | High-Accuracy Centralized Engine |
 
 ---
 
-## 2. Experimental Protocol v2 Compliance & Information Parity
+## 3. Advanced Mitigation of Catastrophic Forgetting & Drift Adaptation
 
-To ensure rigorous benchmarking and eliminate data leakage, the dataset is split chronologically into two 50% partitions:
-- **`data/creditcard_prefix.csv` (142,403 rows, 269 frauds - 0.189% rate):** Historical warm-up partition used exclusively by `pretrain.py` to overcome the "Cold Start" problem.
-- **`data/creditcard_suffix.csv` (142,404 rows, 223 frauds - 0.157% rate):** Strictly locked evaluation stream used exclusively by stream producers (`payment_edge.py`, `boost.py`).
+To address extreme class imbalance (0.17% fraud rate) and continuous negative stream flooding, the engine implements two advanced online mechanisms:
 
-### Scientific Evaluation Metrics (Protocol v2)
-In extreme class imbalance (fraud rate < 0.2%), standard ROC-AUC and Accuracy provide overly optimistic, misleading scores. This engine enforces:
-- **`PrecisionRecallAUC` (Rolling PRAUC):** Measures the Area Under the Precision-Recall curve over a rolling sliding window ($W=1000$).
-- **$Pr@k$ (Precision at $k$):** Measures the precision within the top-$k$ riskiest transactions matching operational alert budgets:
-  $$k = \max(1, \text{round}(\alpha \times \text{fraud\_rate} \times M))$$
-  where $\alpha = 1.0$ (default alert budget multiplier) and $M$ is the labeled window size.
+### 3.1. Prioritized Experience Replay (PER) for Fraud Signatures
+- A dedicated ring buffer maintains the most recent 100 verified fraud transactions.
+- During high-volume legitimate transaction streams, the engine periodically triggers replay cycles every $N$ normal transactions (configurable, default $N=10$).
+- Sampling priority is proportional to the prediction error:
+  $$\delta_i = 1 - P(\text{fraud} \mid x_i)$$
+  Hard positive samples (cases where the model assigned low fraud probability) receive the highest probability of replay, actively reinforcing decision boundaries.
 
----
+### 3.2. Gaussian Noise Augmentation
+- When replaying historical fraud samples, the engine injects Gaussian perturbations across numerical features:
+  $$x' = x + \epsilon, \quad \epsilon \sim \mathcal{N}(0, \sigma^2 I)$$
+- Default perturbation intensity: $\sigma = 0.02$.
+- This prevents the online trees from over-specializing on identical historical points and synthesizes nearby feature variations, expanding the effective generalization capacity against mutated fraud schemes.
 
-## 3. Project Architecture
-
-The codebase consists of modular, loosely-coupled components:
-
-- **`pretrain.py`**: Pre-trains SGD and Adam online logistic regression pipelines on `creditcard_prefix.csv` and serializes states to `model_sgd.pkl` and `model_adam.pkl`.
-- **`server.py`**: The Streaming ML Engine exposing REST endpoints for Edge Gateways and Message Broker consumers:
-  - `POST /predict`: Real-time transaction risk scoring (`ALLOW` vs `BLOCK` at threshold 0.7).
-  - `POST /feedback`: Ingests delayed labels, executes `learn_one()`, and updates `RollingPRAUC` and $Pr@k$.
-  - `GET /stats`: Returns live metrics (`prauc_sgd`, `prauc_adam`, `pr_at_k_sgd`, `pr_at_k_adam`, confusion matrices).
-  - `GET /logs`: Serves the latest transaction audit ring buffer.
-- **`view.py`**: Streamlit operational dashboard tracking real-time $Pr@k$, PR-AUC, transaction logs, and ALLOW/BLOCK ratios.
-- **`payment_edge.py`**: Controlled-rate stream simulator mimicking Payment Edge Gateway traffic feeding into the ML Engine.
-- **`boost.py`**: High-performance HTTP session pooling benchmark tool for load and throughput testing.
+### 3.3. Dual-Layer ADWIN Concept Drift Monitoring
+- **River ADWIN (Adaptive Windowing):** Tracks streaming prediction error rates with dynamic statistical cutoffs ($\delta = 0.002$).
+- When statistical drift is flagged, Hoeffding Trees begin growing alternative branches in parallel, swapping them in when their accuracy surpasses stale branches.
 
 ---
 
-## 4. Getting Started
+## 4. Experimental Protocol & Information Parity
 
-### 1. Environment Setup
-```bash
-python -m venv venv
-venv\Scripts\activate
+To eliminate lookahead bias and data leakage, the ULB Credit Card Fraud dataset is split chronologically into two 50% partitions:
+
+- **`data/creditcard_prefix.csv` (142,403 transactions, 269 frauds - 0.189% rate):** Historical warmup partition utilized exclusively by `pretrain.py` to overcome the cold-start penalty.
+- **`data/creditcard_suffix.csv` (142,404 transactions, 223 frauds - 0.157% rate):** Strictly locked streaming evaluation dataset consumed in temporal sequence by stream producers (`payment_edge.py`, `boost.py`).
+
+### Scientific Evaluation Metrics
+Under extreme imbalance, standard ROC-AUC and Accuracy produce misleadingly inflated scores. This system enforces strict operational metrics:
+- **Rolling PR-AUC (`RollingPRAUC`):** Prequential Area Under the Precision-Recall curve calculated via self-balancing binary search tree over a sliding window ($W=500$ to $1000$).
+- **$Pr@k$ (Precision at $k$):** Precision within the top-$k$ riskiest transactions matching bank investigation capacity:
+  $$k = \max(1, \text{round}(\alpha \times \text{fraud\_rate} \times W))$$
+  where $\alpha = 1.0$ (default alert budget multiplier) and $W$ is the sliding window size.
+
+---
+
+## 5. Empirical Benchmark Results (30,000+ Transactions)
+
+In a sustained stress test over 30,000 streaming transactions with injected concept drift:
+
+| Model Architecture | Fraud Detections (True Positives) | Total Ground-Truth Frauds | Global Recognition Rate | Adaptation Characteristics |
+| :--- | :--- | :--- | :--- | :--- |
+| **Hoeffding Adaptive Tree (HAT)** | **109** | 117 | **93.2%** | Rapid branch pruning via ADWIN, high agility |
+| **Adaptive Random Forest (ARF - Optimize)** | **98** | 117 | **83.8%** | Robust ensemble stability, enhanced via PER and Noise Augmentation |
+| **Static Batch Random Forest** | **91** | 117 | **77.8%** | Significant performance degradation during concept drift |
+
+---
+
+## 6. Project Structure
+
+```
+OnlineML-FraudDetection/
+|-- data/
+|   |-- creditcard_prefix.csv         # 50% chronological warm-up data (142,403 rows)
+|   +-- creditcard_suffix.csv         # 50% locked streaming evaluation data (142,404 rows)
+|-- docs/
+|   |-- Bao_Cao_Thu_Hoach_OnlineML_BKTPHCM.docx   # Comprehensive academic technical report
+|   |-- accuracy_30k.png              # Empirical accuracy dashboard verification
+|   +-- build_full_report_docx.py     # Formal Word report generation script
+|-- boost.py                          # Turbo streaming generator with optional Concept Drift
+|-- payment_edge.py                   # Paced Payment Edge Gateway simulator
+|-- pretrain.py                       # Pre-training and serialization of baseline models
+|-- server.py                         # High-performance FastAPI streaming inference server
+|-- split_data.py                     # Chronological dataset partitioning utility
+|-- view.py                           # Clean standard operational Streamlit dashboard
+|-- view_optimize.py                  # Full deep-dive Optimize dashboard (PER & Augmentation)
+|-- requirements.txt                  # Python dependencies
++-- README.md                         # Project documentation and specifications
+```
+
+---
+
+## 7. Getting Started
+
+### 7.1. Environment Setup
+```powershell
+# Clone the repository
+git clone https://github.com/Lomgz/OnlineML-FraudDetection.git
+cd OnlineML-FraudDetection
+
+# Create and activate virtual environment
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Pre-training the Edge Models (Prefix 50%)
-Initialize the model weights on the 50% historical prefix to eliminate the cold-start penalty:
-```bash
+### 7.2. Data Preparation & Pre-training
+If `data/creditcard_prefix.csv` and `data/creditcard_suffix.csv` are not present, partition the dataset and pre-train the models:
+```powershell
+# 1. Chronological split of creditcard.csv (if raw CSV is present)
+python split_data.py
+
+# 2. Warm up and serialize initial model weights
 python pretrain.py
 ```
-*Outputs: `model_sgd.pkl` and `model_adam.pkl`.*
+*Outputs: `model_hat.pkl`, `model_arf.pkl`, `model_rf.pkl`, `model_sgd.pkl`, `model_adam.pkl`.*
 
-### 3. Running the Streaming System
+### 7.3. Running the Streaming System
+
 Open three separate terminal windows with virtual environment activated:
 
-**Terminal 1: Start the ML Engine (Edge Gateway / Broker Consumer)**
-```bash
+**Terminal 1: Start the Streaming ML Server**
+```powershell
 uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-**Terminal 2: Launch the Operational Dashboard**
-```bash
+**Terminal 2: Launch the Monitoring Dashboard**
+```powershell
+# Option A: Standard operational monitor
 streamlit run view.py
+
+# Option B: Advanced Optimize monitor (PER, Noise Augmentation, Hard Positives)
+streamlit run view_optimize.py
 ```
 
-**Terminal 3: Start the Payment Stream Simulator (Suffix 50%)**
-```bash
-# Standard Payment Edge simulation with 10ms pacing
+**Terminal 3: Stream Transactions to the Server**
+```powershell
+# Standard edge streaming with 10ms pacing:
 python payment_edge.py --rows 1000 --delay 0.01
 
-# Or turbo stress-test load testing:
+# Or high-throughput turbo load testing:
 python boost.py --rows 5000
+
+# Or stress-testing with Concept Drift:
+python boost.py --rows 10000 --drift --drift-start 1500 --drift-len 800
 ```
 
 ---
 
-## 5. Technical Note on Feature Engineering
+## 8. REST API Reference
 
-The original dataset includes a `Time` column indicating seconds elapsed since the first transaction. Because `Time` is strictly monotonically increasing, feeding it into an online streaming `StandardScaler` causes catastrophic statistical distortion during repeated stream passes. Therefore, the `Time` feature is explicitly dropped across all ingestion pipelines, preserving strictly translation-invariant features ($V_1$ through $V_{28}$ and `Amount`).
+The FastAPI streaming engine exposes the following production endpoints:
+
+- `POST /predict`: Real-time transaction scoring. Returns individual probabilities across all models and gateway action (`ALLOW` vs `BLOCK` based on configurable threshold, default `0.70`).
+- `POST /feedback`: Asynchronous ground-truth label ingestion. Executes `learn_one()`, records prediction error, triggers ADWIN drift checks, and updates the PER buffer.
+- `GET /stats`: Returns live streaming metrics (Rolling PR-AUC, Precision@k, cumulative confusion matrices, global recognition counts).
+- `GET /drift_info`: Returns status of ADWIN drift detector, warning flags, and historical drift timestamps.
+- `GET /replay_info`: Returns current PER buffer occupancy, total replays executed, top hardest fraud samples, and original vs augmented feature comparisons.
+- `POST /replay_config`: Dynamically updates PER and Gaussian noise hyperparameters (`enable_per`, `enable_noise_aug`, `noise_std`, `replay_interval`).
+- `POST /config`: Configures operational parameters in real time (`block_threshold`, `alert_budget_alpha`, `window_size`).
+- `GET /logs`: Serves the in-memory circular audit buffer (latest transactions with probability traces and decisions).
+
+---
+
+## 9. Feature Processing Specification
+
+The raw ULB dataset contains a `Time` column denoting elapsed seconds from the initial recording. Because `Time` increases monotonically, feeding it into a streaming `StandardScaler` induces continuous statistical distortion during stream replay. Therefore, the `Time` feature is explicitly dropped across all ingestion pipelines, preserving strictly translation-invariant features ($V_1$ through $V_{28}$ and `Amount`).
