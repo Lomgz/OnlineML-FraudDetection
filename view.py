@@ -155,7 +155,8 @@ with st.sidebar:
     st.subheader("Thong Tin Kien Truc")
     st.markdown("""
 - **Dinh vi:** Payment Edge Gateways
-- **Mo hinh:** Online Logistic Regression (SGD & Adam)
+- **Batch Baseline:** Random Forest (Scikit-Learn, Static)
+- **Online ML:** Logistic Regression (River SGD & Adam)
 - **Chuan danh gia:** Experimental Protocol v2
 - **Du lieu:** ULB Suffix 50% (142,404 txs)
     """)
@@ -190,7 +191,10 @@ def render_dashboard():
     sk_ap_adam_val = stats.get('sk_ap_adam', 0.0)
     prauc_rf_val = stats.get('prauc_rf', 0.0) 
     sk_ap_rf_val = stats.get('sk_ap_rf', 0.0)
-
+    pr_k_rf_pct = stats.get('pr_at_k_rf', 0.0) * 100
+    pr_k_sgd_pct = stats.get('pr_at_k_sgd', 0.0) * 100  
+    pr_k_adam_pct = stats.get('pr_at_k_adam', 0.0) * 100
+    
     col_kpi4.metric(
         "PR-AUC (SGD)",
         f"{prauc_sgd_val:.4f}",
@@ -269,6 +273,16 @@ def render_dashboard():
 
             st.divider()
             st.subheader("Hieu Nang Mo Hinh Theo Chuan Protocol v2")
+            st.markdown("### Bảng Tổng Hợp Benchmark (Batch vs Online)")
+            benchmark_data = {
+                "Model": ["Random Forest (Sklearn)", "Logistic Regression (SGD - River)", "Logistic Regression (Adam - River)"],
+                "Family": ["Batch (Offline Baseline)", "Online (Streaming)", "Online (Streaming)"],
+                "Mean PR-AUC": [f"{prauc_rf_val:.4f}", f"{prauc_sgd_val:.4f}", f"{prauc_adam_val:.4f}"],
+                "Precision@k": [f"{stats.get('pr_at_k_rf', 0.0)*100:.2f}%", f"{stats.get('pr_at_k_sgd', 0.0)*100:.2f}%", f"{stats.get('pr_at_k_adam', 0.0)*100:.2f}%"]
+            }
+            st.dataframe(pd.DataFrame(benchmark_data), use_container_width=True)
+            st.divider()
+
             col_perf1, col_perf2, col_perf3 = st.columns(3)
 
             k_val = stats.get("k_eval", 1)
@@ -300,7 +314,17 @@ True Positives : {stats.get('cm_adam', {}).get('tp', 0):<6} | False Positives: {
 False Negatives: {stats.get('cm_adam', {}).get('fn', 0):<6} | True Negatives : {stats.get('cm_adam', {}).get('tn', 0):<6}
 ```
 """)
-
+            with col_perf3:
+                st.markdown(f"""
+**Batch RF Pr@{k_val} (Top-{k_val} Alert Budget)**: `{pr_k_rf_pct:.2f}%`
+* **River Rolling PR-AUC**: `{prauc_rf_val:.4f}`
+* **Scikit-learn Average Precision (AP)**: `{sk_ap_rf_val:.4f}`
+* **Cua so tinh toan**: `{win_size}` giao dich gan nhat (`{frauds_in_win}` ca gian lan)
+```text
+Ma tran nham lan tich luy (Batch RF - {stats.get('total', 0):,} txs):
+True Positives : {stats.get('cm_rf', {}).get('tp', 0):<6} | False Positives: {stats.get('cm_rf', {}).get('fp', 0):<6}
+False Negatives: {stats.get('cm_rf', {}).get('fn', 0):<6} | True Negatives : {stats.get('cm_rf', {}).get('tn', 0):<6}
+""")   
             st.divider()
             st.subheader("Nhat Ky Giao Dich Gan Nhat (Audit Log)")
             display_df = df[["transaction_id", "prob_sgd", "prob_adam", "prob_rf", "action", "timestamp"]].copy()

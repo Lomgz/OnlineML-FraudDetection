@@ -269,7 +269,12 @@ def feedback_label(payload: FeedbackPayload):
                 "tn": cm_adam.true_negatives(1),
                 "fn": cm_adam.false_negatives(1)
             }
-
+            stats["cm_rf"] = {
+                "tp": cm_rf.true_positives(1),
+                "fp": cm_rf.false_positives(1),
+                "tn": cm_rf.true_negatives(1),
+                "fn": cm_rf.false_negatives(1)
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

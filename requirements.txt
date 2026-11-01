@@ -6,3 +6,5 @@ fastapi
 uvicorn[standard]
 requests
 pydantic
+scikit-learn
+joblib
