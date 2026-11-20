@@ -31,7 +31,9 @@ Note.txt
 
 # Datasets
 *.csv
+!results/*.csv
 data/
+
 
 # Documentation
 docs/

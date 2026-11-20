@@ -2,9 +2,11 @@ import argparse
 import csv
 import json
 import os
+from queue import PriorityQueue
 import sys
 import time
 import uuid
+import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
 
@@ -16,11 +18,10 @@ parser.add_argument("--drift", action="store_true", help="Kich hoat Concept Drif
 parser.add_argument("--drift-start", type=int, default=1500, help="Giao dich bat dau kich hoat Drift")
 parser.add_argument("--drift-len", type=int, default=800, help="Do dai dot tan cong Concept Drift")
 parser.add_argument("--data", type=str, default="data/creditcard_suffix.csv", help="Duong dan tep CSV giao dich")
+parser.add_argument("--seed", type=int, default=42, help="Random seed cho phan phoi do tre")
 args = parser.parse_args()
 
 SERVER = args.server.rstrip("/")
-BATCH_URL = f"{SERVER}/batch_stream"
-STREAM_TX_URL = f"{SERVER}/stream_tx"
 PREDICT_URL = f"{SERVER}/predict"
 FEEDBACK_URL = f"{SERVER}/feedback"
 STATUS_FILE = "boost_status.json"
@@ -78,26 +79,19 @@ def main():
                 pass
         sys.exit(1)
 
+    np.random.seed(args.seed)
     count = 0
     fraud_count = 0
+    seq_id = 0
+    delayed_queue = PriorityQueue()
     start_time = time.time()
     update_status(0, args.rows, 0, True, 0.0)
 
-    use_batch = True
-    try:
-        test_resp = session.post(BATCH_URL, json={"transactions": []}, timeout=2)
-        if test_resp.status_code != 200:
-            use_batch = False
-    except Exception:
-        use_batch = False
-
-    mode_str = f"Batch Micro-Stream ({args.batch_size} txs/req)" if use_batch else "Single Stream"
-    print(f"[Turbo Boost] Che do truyen: {mode_str}")
+    print("[Turbo Boost] Che do truyen: Delayed Feedback Stream (Normal(50,10) / LogNormal(6,0.5))")
 
     try:
         with open(args.data, newline="", encoding="utf-8") as csvfile:
             reader = csv.DictReader(csvfile)
-            batch = []
 
             for raw_row in reader:
                 if count >= args.rows:
@@ -116,35 +110,57 @@ def main():
                             if k in features:
                                 features[k] = -features[k]
 
-                tx_id = str(uuid.uuid4())[:8]
+                count += 1
+                tx_id = f"{count}-{uuid.uuid4().hex[:6]}"
                 if true_label == 1:
                     fraud_count += 1
-                count += 1
 
-                if use_batch:
-                    batch.append({"features": features, "label": true_label, "transaction_id": tx_id})
-                    if len(batch) >= args.batch_size or count >= args.rows:
-                        try:
-                            session.post(BATCH_URL, json={"transactions": batch}, timeout=5)
-                        except Exception as e:
-                            print(f"[Turbo Boost] Loi gui batch: {e}")
-                        batch = []
+                # 1. Gui du doan tuc thoi (In-flight)
+                try:
+                    pred_resp = session.post(PREDICT_URL, json={"features": features, "transaction_id": tx_id}, timeout=5)
+                    pred_resp.raise_for_status()
+                except Exception as e:
+                    print(f"[Turbo Boost] Loi /predict TX-{tx_id}: {e}")
+                    continue
+
+                # 2. Xep nhan vao hang doi tre
+                if true_label == 0:
+                    delay_steps = int(max(1, round(np.random.normal(50, 10))))
                 else:
-                    try:
-                        session.post(STREAM_TX_URL, json={"features": features, "label": true_label, "transaction_id": tx_id}, timeout=3)
-                    except Exception:
+                    delay_steps = int(max(1, round(np.random.lognormal(6.0, 0.5))))
+                seq_id += 1
+                delayed_queue.put((count + delay_steps, seq_id, tx_id, true_label))
+
+                # 3. Phat cac nhan da den han ve /feedback (khong gui features)
+                while not delayed_queue.empty():
+                    earliest_due, _, f_tx_id, f_label = delayed_queue.queue[0]
+                    if earliest_due <= count:
+                        delayed_queue.get()
                         try:
-                            session.post(PREDICT_URL, json={"features": features, "transaction_id": tx_id}, timeout=3)
-                            session.post(FEEDBACK_URL, json={"features": features, "label": true_label, "transaction_id": tx_id}, timeout=3)
-                        except Exception:
-                            pass
+                            fb_resp = session.post(FEEDBACK_URL, json={"transaction_id": f_tx_id, "label": f_label}, timeout=5)
+                            fb_resp.raise_for_status()
+                        except Exception as e:
+                            print(f"[Turbo Boost] Loi /feedback TX-{f_tx_id}: {e}")
+                    else:
+                        break
 
                 if count % 200 == 0 or count >= args.rows:
                     elapsed = max(0.01, time.time() - start_time)
                     cur_speed = count / elapsed
                     update_status(count, args.rows, fraud_count, True, cur_speed)
                     if count % 1000 == 0:
-                        print(f"[Turbo Boost] Da gui {count:,}/{args.rows:,} giao dich ({cur_speed:.0f} tx/s, {fraud_count} gian lan)")
+                        print(f"[Turbo Boost] Da gui {count:,}/{args.rows:,} giao dich ({cur_speed:.0f} tx/s, {fraud_count} gian lan, queue={delayed_queue.qsize()})")
+
+            # Xa not cac nhan tre con lai trong hang doi khi ket thuc luong
+            if not delayed_queue.empty():
+                print(f"[Turbo Boost] Dang xa {delayed_queue.qsize()} nhan tre cuoi cung...")
+                while not delayed_queue.empty():
+                    _, _, f_tx_id, f_label = delayed_queue.get()
+                    try:
+                        fb_resp = session.post(FEEDBACK_URL, json={"transaction_id": f_tx_id, "label": f_label}, timeout=5)
+                        fb_resp.raise_for_status()
+                    except Exception as e:
+                        print(f"[Turbo Boost] Loi flush TX-{f_tx_id}: {e}")
 
     except FileNotFoundError:
         print(f"[Turbo Boost Error] Khong tim thay tep: {args.data}")

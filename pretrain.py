@@ -40,10 +40,11 @@ def main():
             for raw_row in reader:
                 features, label = parse_row(raw_row)
 
-                # Trong so phat cao cho lop gian lan (class imbalance)
+                # Trong so phat cao cho HAT; River ARFClassifier.learn_one bo qua **kwargs
+                # va tu dung Poisson bagging, nen goi truc tiep learn_one(features, label).
                 weight = 250.0 if label == 1 else 1.0
                 model_hat.learn_one(features, label, w=weight)
-                model_arf.learn_one(features, label, w=weight)
+                model_arf.learn_one(features, label)
 
                 X_train_batch.append(features)
                 y_train_batch.append(label)

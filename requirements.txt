@@ -8,3 +8,7 @@ requests
 pydantic
 scikit-learn
 joblib
+matplotlib
+pytest
+httpx
+numpy

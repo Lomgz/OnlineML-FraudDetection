@@ -110,6 +110,7 @@ engine_config = {
     "enable_noise_aug": True,    # Thêm nhiễu Gaussian sinh biến thể
     "noise_std": 0.02,           # Độ lệch chuẩn nhiễu
     "replay_interval": 10,       # Ôn tập 1 mẫu sau mỗi N giao dịch hợp lệ
+    "grace_period": 50,          # Chu kỳ phân nhánh cây Hoeffding (hạ xuống 20 khi có Drift)
 }
 
 
@@ -142,13 +143,44 @@ def compute_pr_at_k(window: list, score_key: str = "prob_arf", alpha: float = 1.
 
 
 transaction_log = []
+# Bộ đệm lưu trữ giao dịch chờ nhãn (Delayed Feedback Cache)
+features_cache = {}
+
 LOG_MAX = 500
 prauc_history = []
+latency_history = deque(maxlen=1000)
+latency_hat_history = deque(maxlen=1000)
+latency_arf_history = deque(maxlen=1000)
+latency_rf_history = deque(maxlen=1000)
 log_lock = threading.Lock()
 
 # Bộ phát hiện Concept Drift: River ADWIN
 adwin = drift.ADWIN(delta=0.005)
 drift_points = []
+drift_recovery_remaining = 0
+baseline_adaptive_config = {
+    "block_threshold": 0.70,
+    "replay_interval": 10,
+    "grace_period": 50,
+}
+
+def set_trees_grace_period(gp: int):
+    """Đổi grace_period động cho HAT và các cây con của ARF (hỗ trợ cả River Pipeline)."""
+    engine_config["grace_period"] = gp
+    for mdl in (model_hat, model_arf):
+        if mdl is None:
+            continue
+        target = list(mdl.steps.values())[-1] if hasattr(mdl, "steps") and mdl.steps else mdl
+        try:
+            if hasattr(target, "grace_period"):
+                target.grace_period = gp
+            for member in getattr(target, "models", getattr(target, "data", [])):
+                if hasattr(member, "grace_period"):
+                    member.grace_period = gp
+                elif hasattr(member, "model") and hasattr(member.model, "grace_period"):
+                    member.model.grace_period = gp
+        except Exception as e:
+            print(f"[Adaptive Hook Warning] Khong the doi grace_period: {e}")
 
 stats = {
     "total": 0,
@@ -194,6 +226,15 @@ stats = {
     "roc_auc_adam": 0.0,
     "acc_sgd": 0.0,
     "acc_adam": 0.0,
+    "avg_latency_ms": 0.0,
+    "avg_latency_hat_ms": 0.0,
+    "avg_latency_arf_ms": 0.0,
+    "avg_latency_rf_ms": 0.0,
+    "pending_cache_size": 0,
+    "drift_recovery_remaining": 0,
+    "tradeoff_hat": {"precision": 0.0, "recall": 0.0, "fpr": 0.0, "f1": 0.0, "f2": 0.0},
+    "tradeoff_arf": {"precision": 0.0, "recall": 0.0, "fpr": 0.0, "f1": 0.0, "f2": 0.0},
+    "tradeoff_rf":  {"precision": 0.0, "recall": 0.0, "fpr": 0.0, "f1": 0.0, "f2": 0.0},
 }
 
 
@@ -252,83 +293,62 @@ class Transaction(BaseModel):
 
 
 class FeedbackPayload(BaseModel):
-    features: dict
+    transaction_id: str
     label: int
-    transaction_id: Optional[str] = None
-
-
-class StreamTransaction(BaseModel):
-    features: dict
-    label: int
-    transaction_id: Optional[str] = None
-
-
-class BatchTransactions(BaseModel):
-    transactions: list[StreamTransaction]
+    features: Optional[dict] = None
 
 
 # -------------------------------------------------------------
 # 5. CORE STREAMING LOGIC
 # -------------------------------------------------------------
-def _execute_stream_step_locked(x: dict, y: int, tx_id: Optional[str] = None, override_rf_prob: Optional[float] = None) -> tuple[dict, bool]:
-    """Thực thi dự đoán, cập nhật online learning, ôn tập mẫu và đánh giá hiệu năng."""
-    global clean_tx_counter
+def _execute_stream_step_locked(
+    x: dict,
+    y: int,
+    tx_id: Optional[str] = None,
+    cached_probs: Optional[dict] = None,
+) -> tuple[dict, bool]:
+    global clean_tx_counter, drift_recovery_remaining
 
-    # 1. Dự đoán xác suất gian lận
-    try:
-        proba_hat = model_hat.predict_proba_one(x)
-        prob_hat = proba_hat.get(1, 0.0) if proba_hat else 0.0
-
-        proba_arf = model_arf.predict_proba_one(x)
-        prob_arf = proba_arf.get(1, 0.0) if proba_arf else 0.0
-
-        if override_rf_prob is not None:
-            prob_rf = override_rf_prob
-        else:
+    # 1. Lấy lại xác suất đã dự đoán tại thời điểm t
+    if cached_probs is not None:
+        prob_hat = float(cached_probs.get("prob_hat", 0.0))
+        prob_arf = float(cached_probs.get("prob_arf", 0.0))
+        prob_rf  = float(cached_probs.get("prob_rf", 0.0))
+        threshold_used = float(cached_probs.get("threshold_used", engine_config.get("block_threshold", 0.70)))
+        record = cached_probs
+    else:
+        try:
+            proba_hat = model_hat.predict_proba_one(x)
+            prob_hat = proba_hat.get(1, 0.0) if proba_hat else 0.0
+            proba_arf = model_arf.predict_proba_one(x)
+            prob_arf = proba_arf.get(1, 0.0) if proba_arf else 0.0
             prob_rf_array = model_rf.predict_proba([x]) if model_rf else [[0.0, 0.0]]
             prob_rf = float(prob_rf_array[0][1])
-    except Exception:
-        prob_hat = 0.0
-        prob_arf = 0.0
-        prob_rf = 0.0
+        except Exception:
+            prob_hat = prob_arf = prob_rf = 0.0
+        threshold_used = float(engine_config.get("block_threshold", 0.70))
+        record = {"transaction_id": tx_id, "prob_hat": prob_hat, "prob_arf": prob_arf, "prob_rf": prob_rf}
 
-    threshold = engine_config.get("block_threshold", 0.70)
-    action = "BLOCK" if prob_arf > threshold else "ALLOW"
-
-    # 2. Ghi nhận giao dịch
+    # 2. Ghi nhận giao dịch đã có nhãn
     stats["total"] += 1
-    if action == "BLOCK":
-        stats["blocked"] += 1
     if y == 1:
         stats["fraud_detected"] += 1
 
-    record = {
-        "transaction_id": tx_id,
-        "fraud_probability": round(prob_arf, 6),
-        "prob_hat": round(prob_hat, 6),
-        "prob_arf": round(prob_arf, 6),
-        "prob_rf": round(prob_rf, 6),
-        "prob_sgd": round(prob_hat, 6),
-        "prob_adam": round(prob_arf, 6),
-        "action": action,
-        "timestamp": time.time(),
-    }
-    transaction_log.append(record)
-    if len(transaction_log) > LOG_MAX:
-        transaction_log.pop(0)
-
     # 3. Học trực tuyến (Online Incremental Learning)
-    weight = 250.0 if y == 1 else 1.0
-    model_hat.learn_one(x, y, w=weight)
     metric_hat.update(y, prob_hat)
-    cm_hat.update(y, 1 if prob_hat > 0.5 else 0)
+    cm_hat.update(y, 1 if prob_hat > threshold_used else 0)
 
-    model_arf.learn_one(x, y, w=weight)
     metric_arf.update(y, prob_arf)
-    cm_arf.update(y, 1 if prob_arf > 0.5 else 0)
+    cm_arf.update(y, 1 if prob_arf > threshold_used else 0)
 
     metric_rf.update(y, prob_rf)
-    cm_rf.update(y, 1 if prob_rf > 0.5 else 0)
+    cm_rf.update(y, 1 if prob_rf > threshold_used else 0)
+
+    weight = 250.0 if y == 1 else 1.0
+    model_hat.learn_one(x, y, w=weight)
+    # River ARFClassifier.learn_one bo qua **kwargs va tu dung Poisson bagging;
+    # mat can bang cua ARF duoc xu ly bang PER + Noise Augmentation thay vi ep w=250.
+    model_arf.learn_one(x, y)
 
     # 4. Ôn tập mẫu gian lận (Prioritized Experience Replay + Noise Augmentation)
     if y == 1:
@@ -364,7 +384,7 @@ def _execute_stream_step_locked(x: dict, y: int, tx_id: Optional[str] = None, ov
                 aug_feat = orig_feat.copy()
 
             model_hat.learn_one(aug_feat, 1, w=250.0)
-            model_arf.learn_one(aug_feat, 1, w=250.0)
+            model_arf.learn_one(aug_feat, 1)
             replay_stats["total_replays"] += 1
             replay_stats["last_replay"] = {
                 "original": orig_feat,
@@ -375,29 +395,46 @@ def _execute_stream_step_locked(x: dict, y: int, tx_id: Optional[str] = None, ov
             }
 
     # 5. Phát hiện Concept Drift bằng ADWIN
+    
+    error_t = abs(float(y) - float(prob_arf))
     score_val = float(metric_arf.get())
     drift_flag = False
-    if score_val > 0.0:
-        rolling_error = max(0.0, min(1.0, 1.0 - score_val))
-        adwin.update(rolling_error)
-        if adwin.drift_detected:
-            stats["drift_count"] += 1
-            stats["last_drift_step"] = stats["total"]
-            drift_flag = True
-            drift_record = {
-                "step": stats["total"],
-                "timestamp": round(time.time(), 2),
-                "prauc": round(score_val, 4),
-                "error": round(rolling_error, 4),
-                "estimation": round(adwin.estimation, 4),
-                "width": adwin.width,
-            }
-            drift_points.append(drift_record)
-            print(f"[ADWIN Drift] Concept Drift detected at transaction #{stats['total']} (PR-AUC={score_val:.4f})")
+
+    adwin.update(error_t)
+    if adwin.drift_detected:
+        stats["drift_count"] += 1
+        stats["last_drift_step"] = stats["total"]
+        drift_flag = True
+
+    # Kích hoạt 3 hành động thích ứng trong 500 bước
+        drift_recovery_remaining = 500
+        set_trees_grace_period(20)                # 1. Hạ grace_period 50 -> 20
+        engine_config["replay_interval"] = 3       # 2. Flash-Replay 1:10 -> 1:3
+        engine_config["block_threshold"] = 0.55    # 3. Hạ ngưỡng chặn 0.70 -> 0.55
+        stats["config"] = dict(engine_config)
+
+        drift_points.append({
+            "step": stats["total"],
+            "timestamp": round(time.time(), 2),
+            "prauc": round(score_val, 4),
+            "error_t": round(error_t, 4),
+            "estimation": round(adwin.estimation, 4),
+            "width": adwin.width,
+        })
+        print(f"[ADWIN Drift] Drift tai buoc #{stats['total']} (e_t={error_t:.4f}) -> Kich hoat 3 hanh dong thich ung (500 buoc)")
+    elif drift_recovery_remaining > 0:
+        drift_recovery_remaining -= 1
+        if drift_recovery_remaining == 0:
+            set_trees_grace_period(baseline_adaptive_config["grace_period"])
+            engine_config["replay_interval"] = baseline_adaptive_config["replay_interval"]
+            engine_config["block_threshold"] = baseline_adaptive_config["block_threshold"]
+            stats["config"] = dict(engine_config)
+            print(f"[ADWIN Recovery] Het 500 buoc tai #{stats['total']}. Khoi phuc cau hinh chuan.")
 
     stats["drift_detected"] = drift_flag
+    stats["drift_recovery_remaining"] = drift_recovery_remaining
     stats["adwin_estimation"] = round(adwin.estimation, 4)
-    stats["adwin_width"] = adwin.width
+    stats["adwin_width"] = adwin.width      
 
     # 6. Cập nhật bộ đệm nhãn
     labeled_buffer.append({
@@ -448,6 +485,10 @@ def _execute_stream_step_locked(x: dict, y: int, tx_id: Optional[str] = None, ov
     stats["global_acc_arf"] = round((tp_arf / tot_f) * 100, 2) if tot_f > 0 else 0.0
     stats["global_acc_rf"]  = round((tp_rf / tot_f) * 100, 2)  if tot_f > 0 else 0.0
 
+    stats["tradeoff_hat"] = compute_tradeoff_metrics(**stats["cm_hat"])
+    stats["tradeoff_arf"] = compute_tradeoff_metrics(**stats["cm_arf"])
+    stats["tradeoff_rf"]  = compute_tradeoff_metrics(**stats["cm_rf"])
+
     # 9. Lưu lịch sử mỗi 10 bước hoặc khi xảy ra drift
     if stats["total"] % 10 == 0 or drift_flag:
         prauc_history.append({
@@ -462,12 +503,24 @@ def _execute_stream_step_locked(x: dict, y: int, tx_id: Optional[str] = None, ov
         })
 
     # 10. Tái tính toán Pr@k và AP theo chu kỳ 50 bước để tối ưu tốc độ
-    if stats["total"] % 50 == 0:
+    if stats["total"] % 50 == 0 or y == 1:
         recompute_window_metrics()
 
     return record, drift_flag
 
-
+def compute_tradeoff_metrics(tp: int, fp: int, tn: int, fn: int) -> dict:
+    precision = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    recall = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    fpr = (fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    f2 = (5 * precision * recall / (4 * precision + recall)) if (4 * precision + recall) > 0 else 0.0
+    return {
+        "precision": round(precision, 6),
+        "recall": round(recall, 6),
+        "fpr": round(fpr, 6),
+        "f1": round(f1, 6),
+        "f2": round(f2, 6),
+    }
 # -------------------------------------------------------------
 # 6. API ENDPOINTS
 # -------------------------------------------------------------
@@ -479,123 +532,120 @@ def root():
         "protocol": "Experimental Protocol v2 (PR-AUC, Pr@k)"
     }
 
-
 @app.post("/predict", tags=["Inference"])
 def predict_transaction(tx: Transaction):
+    t_start = time.perf_counter()
     x = tx.features
-    try:
-        proba_hat = model_hat.predict_proba_one(x)
-        prob_hat = proba_hat.get(1, 0.0) if proba_hat else 0.0
+    tx_id = tx.transaction_id
 
-        proba_arf = model_arf.predict_proba_one(x)
-        prob_arf = proba_arf.get(1, 0.0) if proba_arf else 0.0
-
-        prob_rf_array = model_rf.predict_proba([x]) if model_rf else [[0.0, 0.0]]
-        prob_rf = float(prob_rf_array[0][1])
-    except Exception:
-        prob_hat = prob_arf = prob_rf = 0.0
-
-    threshold = engine_config.get("block_threshold", 0.70)
-    action = "BLOCK" if prob_arf > threshold else "ALLOW"
-    record = {
-        "transaction_id": tx.transaction_id,
-        "fraud_probability": round(prob_arf, 6),
-        "prob_hat": round(prob_hat, 6),
-        "prob_arf": round(prob_arf, 6),
-        "prob_rf": round(prob_rf, 6),
-        "prob_sgd": round(prob_hat, 6),
-        "prob_adam": round(prob_arf, 6),
-        "action": action,
-        "timestamp": time.time(),
-    }
     with log_lock:
+        t_hat = time.perf_counter()
+        try:
+            proba_hat = model_hat.predict_proba_one(x)
+            prob_hat = float(proba_hat.get(1, 0.0)) if proba_hat else 0.0
+        except Exception as e:
+            print(f"[Predict Error - HAT] {e}")
+            prob_hat = 0.0
+        lat_hat_ms = round((time.perf_counter() - t_hat) * 1000.0, 3)
+
+        t_arf = time.perf_counter()
+        try:
+            proba_arf = model_arf.predict_proba_one(x)
+            prob_arf = float(proba_arf.get(1, 0.0)) if proba_arf else 0.0
+        except Exception as e:
+            print(f"[Predict Error - ARF] {e}")
+            prob_arf = 0.0
+        lat_arf_ms = round((time.perf_counter() - t_arf) * 1000.0, 3)
+
+        t_rf = time.perf_counter()
+        try:
+            prob_rf_array = model_rf.predict_proba([x]) if model_rf else [[0.0, 0.0]]
+            prob_rf = float(prob_rf_array[0][1])
+        except Exception as e:
+            print(f"[Predict Error - RF] {e}")
+            prob_rf = 0.0
+        lat_rf_ms = round((time.perf_counter() - t_rf) * 1000.0, 3)
+
+        threshold = engine_config.get("block_threshold", 0.70)
+        action = "BLOCK" if prob_arf > threshold else "ALLOW"
+        latency_ms = round((time.perf_counter() - t_start) * 1000.0, 3)
+
+        record = {
+            "transaction_id": tx_id,
+            "fraud_probability": round(prob_arf, 6),
+            "prob_hat": round(prob_hat, 6),
+            "prob_arf": round(prob_arf, 6),
+            "prob_rf": round(prob_rf, 6),
+            "prob_sgd": round(prob_hat, 6),
+            "prob_adam": round(prob_arf, 6),
+            "action": action,
+            "threshold_used": threshold,
+            "processing_time_ms": latency_ms,
+            "lat_hat_ms": lat_hat_ms,
+            "lat_arf_ms": lat_arf_ms,
+            "lat_rf_ms": lat_rf_ms,
+            "timestamp": time.time(),
+        }
+
+        if action == "BLOCK":
+            stats["blocked"] += 1
+        latency_history.append(latency_ms)
+        latency_hat_history.append(lat_hat_ms)
+        latency_arf_history.append(lat_arf_ms)
+        latency_rf_history.append(lat_rf_ms)
+        stats["avg_latency_ms"] = round(sum(latency_history) / len(latency_history), 3)
+        stats["avg_latency_hat_ms"] = round(sum(latency_hat_history) / len(latency_hat_history), 3)
+        stats["avg_latency_arf_ms"] = round(sum(latency_arf_history) / len(latency_arf_history), 3)
+        stats["avg_latency_rf_ms"] = round(sum(latency_rf_history) / len(latency_rf_history), 3)
+
+        if tx_id:
+            features_cache[tx_id] = {
+                "features": x,
+                "cached_probs": record,
+            }
+            if len(features_cache) > 50000:
+                oldest_key = next(iter(features_cache))
+                del features_cache[oldest_key]
+            stats["pending_cache_size"] = len(features_cache)
+
         transaction_log.append(record)
         if len(transaction_log) > LOG_MAX:
             transaction_log.pop(0)
+
     return record
 
 
 @app.post("/feedback", tags=["Learning"])
 def feedback_label(payload: FeedbackPayload):
-    try:
-        with log_lock:
-            _, drift_flag = _execute_stream_step_locked(payload.features, payload.label, payload.transaction_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    tx_id = payload.transaction_id
+    y = payload.label
+
+    with log_lock:
+        if not tx_id or tx_id not in features_cache:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Transaction ID {tx_id} not found in delayed cache. Cannot learn without features."
+            )
+
+        x = features_cache[tx_id]["features"]
+        cached_probs = features_cache[tx_id]["cached_probs"]
+        del features_cache[tx_id]
+        stats["pending_cache_size"] = len(features_cache)
+
+        try:
+            _, drift_flag = _execute_stream_step_locked(x, y, tx_id, cached_probs=cached_probs)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "status": "model_updated",
-        "prauc_hat": stats["prauc_hat"],
+        "transaction_id": tx_id,
         "prauc_arf": stats["prauc_arf"],
-        "prauc_rf": stats.get("prauc_rf", 0.0),
-        "pr_at_k_hat": stats["pr_at_k_hat"],
         "pr_at_k_arf": stats["pr_at_k_arf"],
-        "pr_at_k_rf": stats.get("pr_at_k_rf", 0.0),
-        "drift_detected": drift_flag,
-        "drift_count": stats["drift_count"],
-        "last_drift_step": stats["last_drift_step"],
-        "prauc_sgd": stats["prauc_hat"],
-        "prauc_adam": stats["prauc_arf"],
-        "pr_at_k_sgd": stats["pr_at_k_hat"],
-        "pr_at_k_adam": stats["pr_at_k_arf"],
         "k_eval": stats["k_eval"],
-        "transaction_id": payload.transaction_id,
-    }
-
-
-@app.post("/stream_tx", tags=["Streaming"])
-def stream_single_transaction(tx: StreamTransaction):
-    """Kết hợp Dự đoán + Phản hồi nhãn trong 1 lượt gọi HTTP."""
-    try:
-        with log_lock:
-            record, drift_flag = _execute_stream_step_locked(tx.features, tx.label, tx.transaction_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return {
-        "status": "processed",
-        "record": record,
         "drift_detected": drift_flag,
-        "prauc_arf": stats["prauc_arf"]
-    }
-
-
-@app.post("/batch_stream", tags=["Streaming"])
-def batch_stream_transactions(payload: BatchTransactions):
-    """Xử lý luồng giao dịch dạng micro-batch tăng tốc tối đa (1000+ tx/s)."""
-    count = 0
-    frauds = 0
-    if not payload.transactions:
-        return {"status": "empty", "batch_count": 0}
-
-    # Tính trước xác suất RF theo batch (vectorized)
-    rf_probs = None
-    if model_rf:
-        try:
-            feats_batch = [item.features for item in payload.transactions]
-            prob_rf_array = model_rf.predict_proba(feats_batch)
-            rf_probs = [float(p[1]) for p in prob_rf_array]
-        except Exception:
-            rf_probs = None
-
-    try:
-        with log_lock:
-            for i, item in enumerate(payload.transactions):
-                rf_p = rf_probs[i] if rf_probs is not None and i < len(rf_probs) else None
-                _execute_stream_step_locked(item.features, item.label, item.transaction_id, override_rf_prob=rf_p)
-                count += 1
-                if item.label == 1:
-                    frauds += 1
-            recompute_window_metrics()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return {
-        "status": "batch_processed",
-        "batch_count": count,
-        "fraud_count": frauds,
-        "total_processed": stats["total"],
-        "prauc_arf": stats["prauc_arf"]
+        "drift_recovery_remaining": stats["drift_recovery_remaining"],
+        "tradeoff_arf": stats.get("tradeoff_arf", {}),
     }
 
 
@@ -629,7 +679,9 @@ def get_config():
 def update_config(cfg: ConfigUpdate):
     with log_lock:
         if cfg.block_threshold is not None:
-            engine_config["block_threshold"] = max(0.01, min(0.99, float(cfg.block_threshold)))
+            val = max(0.01, min(0.99, float(cfg.block_threshold)))
+            engine_config["block_threshold"] = val
+            baseline_adaptive_config["block_threshold"] = val
         if cfg.alert_budget_alpha is not None:
             engine_config["alert_budget_alpha"] = max(0.01, float(cfg.alert_budget_alpha))
         if cfg.window_size is not None:
@@ -641,8 +693,11 @@ def update_config(cfg: ConfigUpdate):
         if cfg.noise_std is not None:
             engine_config["noise_std"] = max(0.001, min(0.20, float(cfg.noise_std)))
         if cfg.replay_interval is not None:
-            engine_config["replay_interval"] = max(1, min(100, int(cfg.replay_interval)))
+            val = max(1, min(100, int(cfg.replay_interval)))
+            engine_config["replay_interval"] = val
+            baseline_adaptive_config["replay_interval"] = val
 
+        stats["config"] = dict(engine_config)
         recompute_window_metrics()
         return {"status": "config_updated", "config": dict(engine_config), "stats": stats}
 
@@ -699,7 +754,7 @@ def models_status():
 
 @app.post("/reload_models", tags=["Configuration"])
 def reload_models():
-    global model_hat, model_arf, model_rf, adwin, clean_tx_counter
+    global model_hat, model_arf, model_rf, adwin, clean_tx_counter, drift_recovery_remaining
     hat_f = MODEL_HAT_FILE if os.path.exists(MODEL_HAT_FILE) else MODEL_SGD_FILE
     arf_f = MODEL_ARF_FILE if os.path.exists(MODEL_ARF_FILE) else MODEL_ADAM_FILE
     if os.path.exists(hat_f) and os.path.exists(arf_f) and os.path.exists(MODEL_RF_FILE):
@@ -710,12 +765,22 @@ def reload_models():
                 model_arf = pickle.load(f)
             with open(MODEL_RF_FILE, "rb") as f:
                 model_rf = pickle.load(f)
+            if model_rf and hasattr(model_rf, "named_steps") and "randomforestclassifier" in model_rf.named_steps:
+                model_rf.named_steps["randomforestclassifier"].n_jobs = 1
             adwin = drift.ADWIN(delta=0.005)
             clean_tx_counter = 0
             drift_points.clear()
             stats["drift_count"] = 0
             stats["drift_detected"] = False
             stats["last_drift_step"] = None
+            drift_recovery_remaining = 0
+            stats["drift_recovery_remaining"] = 0
+            set_trees_grace_period(baseline_adaptive_config["grace_period"])
+            engine_config["block_threshold"] = baseline_adaptive_config["block_threshold"]
+            engine_config["replay_interval"] = baseline_adaptive_config["replay_interval"]
+            stats["config"] = dict(engine_config)
+            features_cache.clear()
+            stats["pending_cache_size"] = 0
         return {"status": "models_reloaded"}
     return {"status": "files_not_found"}
 
@@ -727,6 +792,7 @@ def get_drift_info():
             "drift_detected": stats.get("drift_detected", False),
             "drift_count": stats.get("drift_count", 0),
             "last_drift_step": stats.get("last_drift_step"),
+            "drift_recovery_remaining": stats.get("drift_recovery_remaining", 0),
             "adwin_estimation": stats.get("adwin_estimation", 0.0),
             "adwin_width": stats.get("adwin_width", 0),
             "drift_points": list(drift_points),
